@@ -29,9 +29,35 @@ V2.7.3 是 V2.7 的**定点正确性补丁**：继续保持轻量流程；在 V2
 - Final Visual QA 明确要求：表格页除了看边框/分页，还要核对非空结构化单元格在最终渲染中确实可见。
 - 仍保持 schema `2.7`，不引入 OCR 全表比对、像素级表格识别或额外 manifest。
 
-## 安装 / 升级
+## DeepSeek Harness 桌面版 / 插件管理器安装
 
-PowerShell 在仓库根目录运行：
+本仓库现在同时声明为 **DeepSeek Harness bundle（组合包）**，可以直接交给插件管理器安装。
+
+桌面版“添加插件”里填：
+
+```text
+https://github.com/Ciallo1145/cnki-academic-writing-skill
+```
+
+命令行等价写法：
+
+```powershell
+dsh plugin --profile desktop add github:Ciallo1145/cnki-academic-writing-skill
+```
+
+如果你使用的 profile 不是 `desktop`，把它替换成实际 profile 名，例如 `web`。
+
+安装后 bundle 会挂载一个独立的只读 Skill provider，并从包内加载：
+
+```text
+cnki-academic-writing-v2/SKILL.md
+```
+
+包内 Skill 关闭目录 watcher，避免 Windows 下插件在线更新时因目录句柄被占用而出现 `EPERM rename`。
+
+## 传统本机安装 / 升级
+
+如果不走 DeepSeek Harness 插件管理器，也可以在仓库根目录运行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
