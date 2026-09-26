@@ -798,3 +798,303 @@ def scan_text(text: str, source: str) -> dict[str, Any]:
             if comp:
                 tags.append("comparative-claim")
             if len(cits) >= 3:
+                tags.append("citation-cluster")
+            if generality and len(cits) <= 1 and not attribution_detected:
+                tags.append("evidence-sufficiency-review")
+            if attribution_site_check:
+                tags.append("attribution-evidence-check")
+            if any(h in section for h in SUMMARY_SECTION_HINTS):
+                tags.append("summary-claim")
+            if (nums or strong or comp or generality) and not cits and not any(h in section for h in SUMMARY_SECTION_HINTS):
+                tags.append("claim-without-inline-citation")
+            ai_hits = [ph for ph in AI_PHRASES if ph in sent]
+            struct_hits = [mk for mk in STRUCTURE_MARKERS if mk in sent]
+            if ai_hits:
+                tags.append("ai-template-phrase")
+            if len(struct_hits) >= 2:
+                tags.append("over-structured-sentence")
+            if tags:
+                score = risk_score(tags, nums, strong, cits)
+                claims.append({
+                    "claim_id": f"claim-{len(claims)+1:04d}",
+                    "source": source,
+                    "section": section or "<unsectioned>",
+                    "paragraph": pno,
+                    "sentence_index": idx,
+                    "text": sent,
+                    "citations": cits,
+                    "numbers": nums,
+                    "strong_terms": strong,
+                    "causal_terms": causal,
+                    "comparative_terms": comp,
+                    "generality_terms": generality,
+                    "attribution_detected": attribution_detected,
+                    "attribution_site_check": attribution_site_check,
+                    "metric_terms": [],
+                    "metric_qualifier_pairs": [],
+                    "style_hits": ai_hits,
+                    "structure_hits": struct_hits,
+                    "risk_tags": tags,
+                    "risk_score": score,
+                    "risk_level": risk_level_from_score(score),
+                    "medium_material": None,
+                    "audit_status": "pending",
+                    "verdict": None,
+                    "evidence": [],
+                    "sufficiency_status": "pending" if "evidence-sufficiency-review" in tags else None,
+                    "sufficiency_verdict": None,
+                    "metric_consistency_status": None,
+                    "metric_consistency_verdict": None,
+                    "revision": None,
+                    "notes": None,
+                })
+
+    for c in claims:
+        c["medium_material"] = material_medium_claim(c) if c.get("risk_level") == "medium" else None
+
+    style_findings, section_scores = section_structural_findings(paragraphs)
+    metric_findings = cross_source_metric_findings(paragraphs)
+    high = sum(1 for c in claims if c["risk_level"] == "high")
+    medium = sum(1 for c in claims if c["risk_level"] == "medium")
+    material_medium = sum(1 for c in claims if c.get("risk_level") == "medium" and c.get("medium_material"))
+    sufficiency_reviews = sum(1 for c in claims if "evidence-sufficiency-review" in c.get("risk_tags", []))
+    metric_checks = len(metric_findings)
+    style_density = sum(phrase_counts.values()) / max(len(text) / 1000, 1)
+    marker_density = sum(marker_counts.values()) / max(len(text) / 1000, 1)
+    avg_len = sum(paragraph_lengths) / len(paragraph_lengths) if paragraph_lengths else 0
+    structural_high = sum(1 for f in style_findings if f["severity"] == "high")
+    structural_medium = sum(1 for f in style_findings if f["severity"] == "medium")
+    formula_syntax_issues = sum(1 for f in formula_findings if f.get("syntax_issue"))
+    material_formulas = sum(1 for f in formula_findings if f.get("referenced_in_prose"))
+    dual_validation_formulas = sum(1 for f in formula_findings if f.get("dual_validation_required"))
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": source,
+        "scan_summary": {
+            "claim_candidates": len(claims),
+            "high_risk": high,
+            "medium_risk": medium,
+            "material_medium_risk": material_medium,
+            "evidence_sufficiency_scan_targets": sufficiency_reviews,
+            "cross_source_metric_checks": metric_checks,
+            "formula_review_targets": len(formula_findings),
+            "material_formula_targets": material_formulas,
+            "formula_syntax_issues": formula_syntax_issues,
+            "formula_dual_validation_targets": dual_validation_formulas,
+            "reference_usage_findings": len(ref_usage_findings),
+            "style_phrase_density_per_1k_chars": round(style_density, 2),
+            "structure_marker_density_per_1k_chars": round(marker_density, 2),
+            "avg_paragraph_chars": round(avg_len, 1),
+            "structural_findings": len(style_findings),
+            "high_structural_findings": structural_high,
+            "medium_structural_findings": structural_medium,
+        },
+        # `scan_summary` is the canonical static-scan namespace. `summary` is kept as
+        # a backward-compatible alias for callers written before V2.6.1; it contains
+        # static scan counts only and never completed-review counts.
+        "summary": {
+            "summary_kind": "static_scan",
+            "claim_candidates": len(claims),
+            "high_risk": high,
+            "medium_risk": medium,
+            "material_medium_risk": material_medium,
+            "evidence_sufficiency_scan_targets": sufficiency_reviews,
+            "cross_source_metric_checks": metric_checks,
+            "formula_review_targets": len(formula_findings),
+            "material_formula_targets": material_formulas,
+            "formula_syntax_issues": formula_syntax_issues,
+            "formula_dual_validation_targets": dual_validation_formulas,
+            "reference_usage_findings": len(ref_usage_findings),
+            "style_phrase_density_per_1k_chars": round(style_density, 2),
+            "structure_marker_density_per_1k_chars": round(marker_density, 2),
+            "avg_paragraph_chars": round(avg_len, 1),
+            "structural_findings": len(style_findings),
+            "high_structural_findings": structural_high,
+            "medium_structural_findings": structural_medium,
+        },
+        "style_scan": {
+            "phrase_counts": dict(phrase_counts),
+            "structure_marker_counts": dict(marker_counts),
+            "section_structural_scores": section_scores,
+            "score_note": "Section structural scores are review-priority heuristics, not AI-authorship probabilities.",
+            "note": "Static style hits are review targets, not proof of AI authorship. Pattern density matters more than any single word.",
+        },
+        "style_findings": style_findings,
+        "metric_findings": metric_findings,
+        "formula_findings": formula_findings,
+        "reference_usage_findings": ref_usage_findings,
+        "claims": claims,
+    }
+
+
+def write_report(data: dict[str, Any], path: Path, level: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    s = data.get("scan_summary", data.get("summary", {}))
+    queue = [c for c in data["claims"] if claim_required_for_level(c, level)]
+    style_queue = [f for f in data.get("style_findings", []) if style_required_for_level(f, level)]
+    metric_queue = [f for f in data.get("metric_findings", []) if metric_finding_required_for_level(f, level)]
+    formula_queue = [f for f in data.get("formula_findings", []) if formula_required_for_level(f, level)]
+    ref_queue = list(data.get("reference_usage_findings", []))
+    table_visibility_queue = list(data.get("table_visibility_findings", []))
+    lines = [
+        "# Precision Audit Queue",
+        "",
+        f"Source: `{data['source']}`",
+        f"Effective audit level: `{level}`",
+        "",
+        f"- Claim candidates: {s['claim_candidates']}",
+        f"- High risk: {s['high_risk']}",
+        f"- Medium risk: {s['medium_risk']}",
+        f"- Material medium-risk: {s.get('material_medium_risk', 0)}",
+        f"- Evidence-sufficiency scan targets: {s.get('evidence_sufficiency_scan_targets', 0)}",
+        f"- Cross-source metric checks: {s.get('cross_source_metric_checks', 0)}",
+        f"- Required cross-source metric checks by this level: {len(metric_queue)}",
+        f"- Formula review targets: {s.get('formula_review_targets', 0)}",
+        f"- Required formula reviews by this level: {len(formula_queue)}",
+        f"- Formula syntax issues: {s.get('formula_syntax_issues', 0)}",
+        f"- Reference-usage findings: {len(ref_queue)}",
+        f"- Table-visibility findings: {len(table_visibility_queue)}",
+        f"- Required claims by this level: {len(queue)}",
+        f"- Structural style findings: {s.get('structural_findings', 0)}",
+        f"- Required structural findings by this level: {len(style_queue)}",
+        "",
+        "> Static scanning does not decide truth or AI authorship. Verify claims against exact evidence and review structural findings in context.",
+        "",
+    ]
+
+    if style_queue:
+        lines += ["# Structural AI-pattern review", ""]
+        for f in style_queue:
+            lines += [
+                f"## {f['style_id']} · {f['severity'].upper()} · {f['section']}",
+                "",
+                f"- pattern: {f['pattern_type']}",
+                f"- paragraphs: {f.get('paragraphs', [])}",
+                f"- detail: {f.get('detail', '')}",
+                f"- metrics: {json.dumps(f.get('metrics', {}), ensure_ascii=False)}",
+                "",
+            ]
+            for snip in f.get("snippets", [])[:4]:
+                lines.append(f"> {snip}")
+            lines.append("")
+
+    if metric_queue:
+        lines += ["# Cross-source metric consistency review", ""]
+        for f in metric_queue:
+            lines += [
+                f"## {f['metric_id']} · {f['severity'].upper()} · {f['section']}",
+                "",
+                f["text"],
+                "",
+                f"- citations: {f.get('citations', [])}",
+                f"- numbers: {f.get('numbers', [])}",
+                f"- metric terms: {f.get('metric_terms', [])}",
+                f"- qualifier pairs: {f.get('qualifier_pairs', [])}",
+                "",
+            ]
+
+    if formula_queue:
+        lines += ["# Formula correctness review", ""]
+        for f in formula_queue:
+            lines += [
+                f"## {f['formula_id']} · equation ({f['equation_no']}) · {f['severity'].upper()}",
+                "",
+                f["text"],
+                "",
+                f"- referenced in prose: {f.get('referenced_in_prose', False)}",
+                f"- syntax issue: {f.get('syntax_issue') or '-'}",
+                f"- dual validation required: {f.get('dual_validation_required', False)}",
+                f"- dual validation reasons: {f.get('dual_validation_reasons') or []}",
+                "- review: validate syntax/structure and theoretical correctness; code/result consistency alone is insufficient. When dual validation is required, record two structurally independent `verification_paths` (for example independent-derivation + authoritative-source, or independent-derivation + decision-region-enumeration).",
+                "",
+            ]
+
+    if ref_queue:
+        lines += ["# Reference usage review", ""]
+        for f in ref_queue:
+            lines += [
+                f"## {f['reference_id']} · {f['issue']}",
+                "",
+                f["text"],
+                "",
+            ]
+
+    if table_visibility_queue:
+        lines += ["# DOCX table visibility review", ""]
+        for f in table_visibility_queue:
+            lines += [
+                f"## {f['visibility_id']} · table {f['table']} row {f['row']} cell {f['cell']} · {f['severity'].upper()}",
+                "",
+                f["text"],
+                "",
+                f"- issue: {f.get('issue')}",
+                f"- explicit colors: {f.get('explicit_colors', [])}",
+                f"- cell fill: {f.get('cell_fill') or '-'}",
+                "- review: confirm on the final rendered page whether the structurally non-empty cell is actually visible; correct white/hidden/background-colored text if needed.",
+                "",
+            ]
+
+    if queue:
+        lines += ["# Claim → Citation → Evidence review", ""]
+    for c in queue:
+        lines += [
+            f"## {c['claim_id']} · {c['risk_level'].upper()} · score {c.get('risk_score', '-')} · {c['section']}",
+            "",
+            c["text"],
+            "",
+            f"- tags: {', '.join(c['risk_tags']) or '-'}",
+            f"- citations: {c['citations'] or []}",
+            f"- numbers: {c['numbers'] or []}",
+            f"- strong terms: {c['strong_terms'] or []}",
+            f"- generality terms: {c.get('generality_terms', []) or []}",
+            f"- attribution detected: {c.get('attribution_detected', False)}",
+            f"- attribution citation-site check: {c.get('attribution_site_check', False)}",
+            f"- metric terms: {c.get('metric_terms', []) or []}",
+            f"- material medium: {c.get('medium_material')}",
+            "",
+        ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    level = load_audit_level(root, args.level)
+    inp = Path(args.input).expanduser()
+    if not inp.is_absolute():
+        inp = root / inp
+    inp = inp.resolve()
+    text = read_text(inp)
+    data = scan_text(text, str(inp))
+    table_visibility = docx_table_visibility_findings(inp)
+    data["table_visibility_findings"] = table_visibility
+    for key in ("scan_summary", "summary"):
+        if isinstance(data.get(key), dict):
+            data[key]["table_visibility_findings"] = len(table_visibility)
+    data["effective_audit_level"] = level
+    jout = Path(args.json_out).expanduser()
+    mout = Path(args.md_out).expanduser()
+    if not jout.is_absolute():
+        jout = root / jout
+    if not mout.is_absolute():
+        mout = root / mout
+    jout.parent.mkdir(parents=True, exist_ok=True)
+    jout.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_report(data, mout, level)
+    required = sum(1 for c in data["claims"] if claim_required_for_level(c, level))
+    style_required = sum(1 for f in data.get("style_findings", []) if style_required_for_level(f, level))
+    metric_required = sum(1 for f in data.get("metric_findings", []) if metric_finding_required_for_level(f, level))
+    formula_required = sum(1 for f in data.get("formula_findings", []) if formula_required_for_level(f, level))
+    reference_usage_required = len(data.get("reference_usage_findings", []))
+    table_visibility_required = len(data.get("table_visibility_findings", []))
+    print(json.dumps({
+        "status": "ok",
+        "effective_audit_level": level,
+        "required_by_level": required,
+        "structural_required_by_level": style_required,
+        "metric_consistency_required_by_level": metric_required,
+        "formula_required_by_level": formula_required,
+        "reference_usage_required": reference_usage_required,
+        "table_visibility_required": table_visibility_required,
+        "json": str(jout.resolve()),
+        "markdown": str(mout.resolve()),
