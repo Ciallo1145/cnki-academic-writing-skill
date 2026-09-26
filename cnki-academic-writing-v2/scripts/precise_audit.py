@@ -218,3 +218,283 @@ def docx_table_visibility_findings(path: Path) -> list[dict[str, Any]]:
                     "visibility_id": f"tablevis-{len(out)+1:04d}",
                     "table": ti,
                     "row": ri,
+                    "cell": ci,
+                    "text": cell_text,
+                    "issue": issue,
+                    "explicit_colors": sorted({c for _, c, _ in text_runs if c}),
+                    "cell_fill": fill,
+                    "severity": "high",
+                    "review_status": "pending",
+                    "resolution": None,
+                    "rendered_confirmation": None,
+                    "notes": None,
+                })
+    return out
+
+
+def citation_ids(blob: str) -> list[int]:
+    ids: list[int] = []
+    for part in re.split(r"[,，]", blob):
+        part = part.strip()
+        m = re.fullmatch(r"(\d+)\s*[-–—]\s*(\d+)", part)
+        if m:
+            a, b = map(int, m.groups())
+            if 0 < b - a <= 50:
+                ids.extend(range(a, b + 1))
+            else:
+                ids.extend([a, b])
+        elif part.isdigit():
+            ids.append(int(part))
+    return sorted(set(ids))
+
+
+def infer_section(line: str, current: str) -> str:
+    s = line.strip()
+    if not s:
+        return current
+    if s.startswith("#"):
+        return s.lstrip("# ").strip()
+    if HEAD_RE.match(s) and len(s) <= 80:
+        return s
+    return current
+
+
+def risk_score(tags: list[str], nums: list[str], strong: list[str], cites: list[int]) -> int:
+    score = 0
+    score += 3 if strong else 0
+    score += 2 if nums else 0
+    score += 2 if "citation-cluster" in tags else 0
+    score += 2 if "summary-claim" in tags else 0
+    score += 1 if "causal-claim" in tags else 0
+    score += 1 if "comparative-claim" in tags else 0
+    score += 2 if "evidence-sufficiency-review" in tags else 0
+    score += 2 if "cross-source-metric-check" in tags else 0
+    score += 3 if "attribution-evidence-check" in tags else 0
+    score += 2 if (nums or strong) and not cites else 0
+    return score
+
+
+def risk_level_from_score(score: int) -> str:
+    return "high" if score >= 5 else "medium" if score >= 2 else "low"
+
+
+def load_audit_level(root: Path, requested: str = "auto") -> str:
+    if requested in {"low", "medium", "high"}:
+        return requested
+    cfg = root / "assignment" / "workflow-config.json"
+    if cfg.exists():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8-sig"))
+            level = str(data.get("audit_level", "")).lower()
+            if level in {"low", "medium", "high"}:
+                return level
+        except Exception:
+            pass
+    return "medium"
+
+
+def style_only_claim(c: dict[str, Any]) -> bool:
+    tags = set(c.get("risk_tags", []))
+    return bool(tags) and tags.issubset({"ai-template-phrase", "over-structured-sentence"})
+
+
+def material_medium_claim(c: dict[str, Any]) -> bool:
+    """Return True for MEDIUM candidates that materially affect correctness/argument.
+
+    V2.5.6 deliberately does not equate `risk_level == medium` with `must review`.
+    This keeps MEDIUM a balanced audit instead of a near-HIGH full queue.
+    """
+    tags = set(c.get("risk_tags", []))
+    if tags & {
+        "strong-claim", "citation-cluster", "evidence-sufficiency-review", "attribution-evidence-check",
+    }:
+        return True
+    if "summary-claim" in tags and tags & {"comparative-claim", "causal-claim", "claim-without-inline-citation"}:
+        return True
+    if "claim-without-inline-citation" in tags and tags & {"comparative-claim", "causal-claim"}:
+        return True
+    if {"comparative-claim", "causal-claim"}.issubset(tags):
+        return True
+    return False
+
+
+def claim_required_for_level(c: dict[str, Any], level: str) -> bool:
+    risk = c.get("risk_level")
+    tags = set(c.get("risk_tags", []))
+    # Every level keeps exact numerical claims, high-risk claims, and explicit source-attribution fidelity checks in scope.
+    if risk == "high" or "numeric-claim" in tags or "attribution-evidence-check" in tags:
+        return True
+    if level == "low":
+        return False
+    if level == "medium":
+        return risk == "medium" and material_medium_claim(c)
+    # HIGH: all non-style-only technical claim candidates.
+    return not style_only_claim(c)
+
+
+def style_required_for_level(finding: dict[str, Any], level: str) -> bool:
+    severity = finding.get("severity", "low")
+    if level == "low":
+        return severity == "high"
+    if level == "medium":
+        return severity in {"high", "medium"}
+    return True
+
+
+def metric_finding_required_for_level(finding: dict[str, Any], level: str) -> bool:
+    severity = finding.get("severity", "medium")
+    if level == "low":
+        return severity == "high"
+    return True  # MEDIUM/HIGH review all focused cross-source metric findings.
+
+
+def chinese_ordinal_value(token: str) -> int | None:
+    token = token.strip()
+    if token in CN_NUM:
+        return CN_NUM[token]
+    # Enough for the structural patterns we care about; avoid pretending to be
+    # a complete Chinese-number parser.
+    if token.startswith("十") and len(token) == 2 and token[1] in CN_NUM:
+        return 10 + CN_NUM[token[1]]
+    if token.endswith("十") and len(token) == 2 and token[0] in CN_NUM:
+        return CN_NUM[token[0]] * 10
+    return None
+
+
+def detect_enumerators(line: str) -> list[tuple[str, int, str]]:
+    """Find ordered prose markers at paragraph or sentence starts.
+
+    A single DOCX paragraph may contain several logical list items, so V2.5.3 scans
+    after sentence punctuation as well as at the physical paragraph start.
+    """
+    s = line.strip()
+    out: list[tuple[int, str, int, str]] = []
+    boundary = r"(?:^|(?<=[。！？；;]))\s*"
+    patterns = [
+        ("qi-series", re.compile(boundary + r"其([一二三四五六七八九十]{1,3})(?:是|为|在|：|:|、|，|,|\s)")),
+        ("di-series", re.compile(boundary + r"第([一二三四五六七八九十]{1,3})(?:[，,、。：:]|是|为|\s)")),
+        ("yi-shi-series", re.compile(boundary + r"([一二三四五六七八九十]{1,3})是(?:\s|[^一二三四五六七八九十])")),
+    ]
+    for family, rx in patterns:
+        for m in rx.finditer(s):
+            v = chinese_ordinal_value(m.group(1))
+            if v is not None:
+                out.append((m.start(), family, v, m.group(0).strip()))
+    lexical = [(1, "首先"), (2, "其次"), (3, "再次"), (98, "随后"), (99, "最后")]
+    for v, token in lexical:
+        rx = re.compile(boundary + re.escape(token))
+        for m in rx.finditer(s):
+            out.append((m.start(), "transition-series", v, token))
+    out.sort(key=lambda x: x[0])
+    return [(family, v, token) for _, family, v, token in out]
+
+
+def normalized_paragraph_opener(line: str) -> str | None:
+    s = re.sub(r"\s+", "", line.strip())
+    if not s:
+        return None
+    if re.match(r"^其[一二三四五六七八九十]{1,3}(?:是|为|在)", s):
+        return "其<序数>是/为"
+    if re.match(r"^第[一二三四五六七八九十]{1,3}(?:[，、。：]|是|为)", s):
+        return "第<序数>"
+    if re.match(r"^[一二三四五六七八九十]{1,3}是", s):
+        return "<序数>是"
+    if re.match(r"^(首先|其次|再次|最后)", s):
+        return "顺序连接词"
+    if re.match(r"^从.{1,16}(层面|方面|维度|角度)(看|来看|分析|而言|出发)?", s):
+        return "从…层面/方面/维度"
+    if re.match(r"^(在|对于).{1,18}(层面|方面|场景|条件)(下|中|而言|上)?", s):
+        return "在/对于…层面/场景"
+    return None
+
+
+def paragraph_start_connector(line: str) -> str | None:
+    s = line.strip()
+    for token in PARAGRAPH_START_CONNECTORS:
+        if s.startswith(token):
+            return token
+    return None
+
+
+def section_structural_findings(paragraphs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Detect section-level structural regularity without an exhaustive phrase blacklist."""
+    by_section: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for p in paragraphs:
+        by_section[p["section"]].append(p)
+
+    findings: list[dict[str, Any]] = []
+    section_scores: dict[str, int] = {}
+
+    def add(section: str, pattern_type: str, severity: str, ps: list[dict[str, Any]], detail: str, score_add: int, metrics: dict[str, Any] | None = None) -> None:
+        fid = f"style-{len(findings)+1:04d}"
+        unique_ps=[]
+        seen=set()
+        for para in ps:
+            key=para["paragraph"]
+            if key not in seen:
+                seen.add(key); unique_ps.append(para)
+        findings.append({
+            "style_id": fid,
+            "section": section,
+            "pattern_type": pattern_type,
+            "severity": severity,
+            "paragraphs": [p["paragraph"] for p in unique_ps],
+            "snippets": [p["text"][:180] for p in unique_ps[:6]],
+            "detail": detail,
+            "metrics": metrics or {},
+            "review_status": "pending",
+            "resolution": None,
+            "notes": None,
+        })
+        section_scores[section] = min(100, section_scores.get(section, 0) + score_add)
+
+    for section, ps in by_section.items():
+        section_scores.setdefault(section, 0)
+        if not ps:
+            continue
+
+        # 1) Ordered-enumeration sequence: catch 其一/其二/… regardless of the exact wording after it.
+        fams: dict[str, list[tuple[dict[str, Any], int, str]]] = defaultdict(list)
+        for p in ps:
+            for enum in p.get("enumerators", []):
+                fam, val, token = enum
+                fams[fam].append((p, val, token))
+        for fam, items in fams.items():
+            if len(items) < 3:
+                continue
+            vals = [v for _, v, _ in items]
+            # Preserve paragraph order; require mostly forward progression to avoid random incidental hits.
+            forward = sum(1 for a, b in zip(vals, vals[1:]) if b > a)
+            if forward < max(1, len(vals) - 2):
+                continue
+            sev = "high" if len(items) >= 4 else "medium"
+            add(
+                section,
+                "ordered-enumeration-sequence",
+                sev,
+                [x[0] for x in items],
+                f"Detected {len(items)} ordered prose markers in one section ({', '.join(x[2] for x in items[:6])}). Repeated enumeration may be legitimate, but a long perfectly ordered series is a structural review target.",
+                45 if sev == "high" else 30,
+                {"family": fam, "count": len(items), "ordinals": vals},
+            )
+
+        # 2) Repeated paragraph-opening template. This catches paraphrased but mechanically parallel starts.
+        opener_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for p in ps:
+            if p.get("opener_template"):
+                opener_groups[p["opener_template"]].append(p)
+        for opener, ops in opener_groups.items():
+            if len(ops) >= 3:
+                add(
+                    section,
+                    "repeated-paragraph-opener",
+                    "medium" if len(ops) < 5 else "high",
+                    ops,
+                    f"{len(ops)} paragraphs share the same opening template `{opener}`.",
+                    25 if len(ops) < 5 else 35,
+                    {"template": opener, "count": len(ops)},
+                )
+
+        # 3) Connector-at-paragraph-start density: pattern-based, not a ban on any single connector.
+        connector_ps = [p for p in ps if p.get("start_connector")]
+        if len(ps) >= 4 and len(connector_ps) >= 3 and len(connector_ps) / len(ps) >= 0.5:
