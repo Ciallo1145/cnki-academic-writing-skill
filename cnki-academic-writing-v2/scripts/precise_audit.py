@@ -1098,3 +1098,322 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "table_visibility_required": table_visibility_required,
         "json": str(jout.resolve()),
         "markdown": str(mout.resolve()),
+        **data.get("scan_summary", data.get("summary", {})),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+GENERIC_EVIDENCE_LOCATORS = {
+    "", "full text", "verified full text", "全文", "已核验全文",
+    "段落级引用", "same paragraph", "见全文", "see full text",
+}
+
+
+def evidence_record_is_specific(e: dict[str, Any]) -> bool:
+    """Cheap quality gate for the small set of important reviewed claims.
+
+    We do not build a complex evidence graph here. For high-risk/material-medium
+    claims, a positive verdict should at least point to a real source location and
+    say what that location supports.
+    """
+    source_ref = str(e.get("source_ref") or "").strip()
+    locator = re.sub(r"\s+", " ", str(e.get("locator") or "").strip()).lower()
+    support_note = str(e.get("support_note") or "").strip()
+    if not source_ref or source_ref == "self:paper":
+        return False
+    if locator in GENERIC_EVIDENCE_LOCATORS or len(locator) < 3:
+        return False
+    if len(support_note) < 10:
+        return False
+    return True
+
+
+def claim_needs_specific_evidence(c: dict[str, Any]) -> bool:
+    tags = set(c.get("risk_tags", []))
+    if c.get("risk_level") == "high":
+        return True
+    if c.get("risk_level") == "medium" and bool(c.get("medium_material")):
+        return True
+    return False
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    requested = args.level
+    if getattr(args, "include_medium", False) and requested == "auto":
+        requested = "medium"  # backward compatibility with V2.5 CLI
+    effective = load_audit_level(root, requested)
+    path = Path(args.file).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        print(json.dumps({"status": "warning", "effective_audit_level": effective, "warnings": [f"audit file missing: {path}"]}, ensure_ascii=False, indent=2))
+        return 1
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    # V2.6.1 schema migration: distinguish static scan state from completed audit
+    # execution state even when auditing a V2.5.6/V2.6.0 ledger. This prevents the
+    # historical `evidence_sufficiency_reviews = 0` ambiguity from surviving merely
+    # because an older JSON file was reused.
+    legacy_summary = dict(data.get("scan_summary") or data.get("summary") or {})
+    if "evidence_sufficiency_scan_targets" not in legacy_summary and "evidence_sufficiency_reviews" in legacy_summary:
+        legacy_summary["evidence_sufficiency_scan_targets"] = legacy_summary.pop("evidence_sufficiency_reviews")
+    legacy_summary.pop("evidence_sufficiency_reviews", None)
+    legacy_summary.pop("summary_kind", None)
+    data["schema_version"] = SCHEMA_VERSION
+    data["scan_summary"] = legacy_summary
+    data["summary"] = {"summary_kind": "static_scan", **legacy_summary}
+
+    warnings: list[str] = []
+    pending = 0
+    unresolved = 0
+    required = 0
+    style_pending = 0
+    style_required = 0
+
+    for c in data.get("claims", []):
+        if not claim_required_for_level(c, effective):
+            continue
+        required += 1
+        status = c.get("audit_status")
+        if status in (None, "pending"):
+            pending += 1
+            warnings.append(f"{c.get('claim_id')}: precision audit pending")
+        verdict = c.get("verdict")
+        if verdict in ("unsupported", "partially-supported", "context-mismatch", "overstated", "needs-evidence") and not c.get("revision"):
+            unresolved += 1
+            warnings.append(f"{c.get('claim_id')}: verdict={verdict} but no revision/removal recorded")
+        tags = set(c.get("risk_tags", []))
+        if verdict in ("supported", "corrected", "softened") and claim_needs_specific_evidence(c):
+            # Structural/self-referential statements do not need an external paper merely
+            # because the scanner assigned a high score. Externally checkable claims do.
+            external_fact = bool(c.get("citations")) or bool(tags & {
+                "strong-claim", "causal-claim", "comparative-claim",
+                "evidence-sufficiency-review", "citation-cluster", "attribution-evidence-check",
+            })
+            if external_fact:
+                evidence = [e for e in (c.get("evidence") or []) if isinstance(e, dict)]
+                if not any(evidence_record_is_specific(e) for e in evidence):
+                    warnings.append(
+                        f"{c.get('claim_id')}: high-risk/material claim needs one specific evidence locator "
+                        f"(page/section/paragraph/table/figure) plus a concrete support_note; do not use only 'verified full text'"
+                    )
+        if "evidence-sufficiency-review" in tags:
+            if c.get("sufficiency_status") != "reviewed":
+                warnings.append(f"{c.get('claim_id')}: evidence sufficiency review pending")
+            sv = c.get("sufficiency_verdict")
+            if sv not in {"sufficient", "attribute-to-source", "triangulate", "soften", "not-applicable"}:
+                warnings.append(f"{c.get('claim_id')}: invalid/missing sufficiency verdict")
+            elif sv in {"attribute-to-source", "soften"} and not c.get("revision"):
+                warnings.append(f"{c.get('claim_id')}: sufficiency verdict {sv} requires a recorded revision")
+            elif sv == "triangulate":
+                refs = {str(e.get("source_ref")) for e in c.get("evidence", []) if isinstance(e, dict) and e.get("source_ref")}
+                if len(refs) < 2:
+                    warnings.append(f"{c.get('claim_id')}: triangulate requires at least two distinct evidence sources")
+    for f in data.get("style_findings", []):
+        if not style_required_for_level(f, effective):
+            continue
+        style_required += 1
+        if f.get("review_status") in (None, "pending"):
+            style_pending += 1
+            warnings.append(f"{f.get('style_id')}: structural style review pending")
+        elif f.get("resolution") not in {"keep", "revised", "not-applicable"}:
+            warnings.append(f"{f.get('style_id')}: reviewed structural finding has no valid resolution")
+
+    metric_pending = 0
+    metric_required = 0
+    for f in data.get("metric_findings", []):
+        if not metric_finding_required_for_level(f, effective):
+            continue
+        metric_required += 1
+        if f.get("review_status") != "reviewed":
+            metric_pending += 1
+            warnings.append(f"{f.get('metric_id')}: cross-source metric consistency review pending")
+            continue
+        mv = f.get("verdict")
+        if mv not in {"consistent", "different-definition-disclosed", "revised", "not-applicable"}:
+            warnings.append(f"{f.get('metric_id')}: invalid/missing metric consistency verdict")
+        elif mv == "revised" and not f.get("revision"):
+            warnings.append(f"{f.get('metric_id')}: metric consistency verdict revised requires a recorded revision")
+
+    formula_pending = 0
+    formula_required = 0
+    for f in data.get("formula_findings", []):
+        if not formula_required_for_level(f, effective):
+            continue
+        formula_required += 1
+        if f.get("review_status") != "reviewed":
+            formula_pending += 1
+            warnings.append(f"{f.get('formula_id')}: formula correctness review pending")
+            continue
+        verdict = f.get("verdict")
+        if verdict not in {"validated", "corrected", "not-applicable"}:
+            warnings.append(f"{f.get('formula_id')}: invalid/missing formula verdict")
+            continue
+        if f.get("syntax_issue") and verdict == "validated":
+            warnings.append(f"{f.get('formula_id')}: scanner found `{f.get('syntax_issue')}`; mark corrected or explain not-applicable")
+        if verdict == "corrected" and not f.get("revision"):
+            warnings.append(f"{f.get('formula_id')}: corrected formula requires a recorded revision")
+        if verdict in {"validated", "corrected"}:
+            paths = f.get("verification_paths") or []
+            allowed_path_methods = {
+                "independent-derivation", "authoritative-source", "decision-region-enumeration",
+                "numerical-integration", "limiting-special-case", "dimensional-normalization-check",
+            }
+            if f.get("referenced_in_prose"):
+                method = f.get("verification_method")
+                note = str(f.get("verification_note") or "").strip()
+                if method not in {"independent-derivation", "authoritative-source", "both"} and not paths:
+                    warnings.append(f"{f.get('formula_id')}: material formula needs verification_method or verification_paths")
+                if len(note) < 12 and not paths:
+                    warnings.append(f"{f.get('formula_id')}: material formula needs a concrete independent verification_note")
+            if f.get("dual_validation_required"):
+                if not isinstance(paths, list) or len(paths) < 2:
+                    warnings.append(f"{f.get('formula_id')}: complex/high-risk formula requires at least two structurally independent verification_paths")
+                else:
+                    methods: list[str] = []
+                    for i, path_item in enumerate(paths, 1):
+                        if not isinstance(path_item, dict):
+                            warnings.append(f"{f.get('formula_id')}: verification_paths[{i}] must be an object with method/note")
+                            continue
+                        pm = str(path_item.get("method") or "").strip()
+                        pn = str(path_item.get("note") or "").strip()
+                        methods.append(pm)
+                        if pm not in allowed_path_methods:
+                            warnings.append(f"{f.get('formula_id')}: verification_paths[{i}] has invalid method `{pm}`")
+                        if len(pn) < 12:
+                            warnings.append(f"{f.get('formula_id')}: verification_paths[{i}] needs a concrete note")
+                    valid_methods = [m for m in methods if m in allowed_path_methods]
+                    if len(set(valid_methods)) < 2:
+                        warnings.append(f"{f.get('formula_id')}: dual validation paths must use at least two distinct methods")
+
+    formula_dual_required = sum(1 for f in data.get("formula_findings", []) if formula_required_for_level(f, effective) and f.get("dual_validation_required"))
+    formula_dual_pending = 0
+    for f in data.get("formula_findings", []):
+        if not (formula_required_for_level(f, effective) and f.get("dual_validation_required")):
+            continue
+        paths = f.get("verification_paths") or []
+        methods = {str(x.get("method") or "").strip() for x in paths if isinstance(x, dict)}
+        if len(paths) < 2 or len(methods) < 2:
+            formula_dual_pending += 1
+
+    reference_usage_pending = 0
+    reference_usage_required = 0
+    for f in data.get("reference_usage_findings", []):
+        reference_usage_required += 1
+        if f.get("review_status") != "reviewed":
+            reference_usage_pending += 1
+            warnings.append(f"{f.get('reference_id')}: reference-usage review pending ({f.get('issue')})")
+            continue
+        resolution = f.get("resolution")
+        if resolution not in {"removed", "cited", "keep-justified", "not-applicable"}:
+            warnings.append(f"{f.get('reference_id')}: invalid/missing reference-usage resolution")
+        if resolution in {"keep-justified", "not-applicable"} and len(str(f.get("notes") or "").strip()) < 8:
+            warnings.append(f"{f.get('reference_id')}: {resolution} requires a concrete note")
+
+    table_visibility_pending = 0
+    table_visibility_required = 0
+    for f in data.get("table_visibility_findings", []):
+        table_visibility_required += 1
+        if f.get("review_status") != "reviewed":
+            table_visibility_pending += 1
+            warnings.append(f"{f.get('visibility_id')}: table-visibility review pending ({f.get('issue')})")
+            continue
+        resolution = f.get("resolution")
+        if resolution not in {"corrected", "confirmed-visible", "false-positive", "not-applicable"}:
+            warnings.append(f"{f.get('visibility_id')}: invalid/missing table-visibility resolution")
+        rendered = f.get("rendered_confirmation")
+        if resolution in {"confirmed-visible", "false-positive", "not-applicable"} and rendered not in {"visible", "not-applicable"}:
+            warnings.append(f"{f.get('visibility_id')}: {resolution} requires rendered_confirmation=visible or not-applicable")
+        if resolution == "corrected" and len(str(f.get("notes") or "").strip()) < 8:
+            warnings.append(f"{f.get('visibility_id')}: corrected table visibility requires a concrete note")
+
+    # V2.6.1 separates static scan targets from completed/historical review records.
+    # A corrected sentence may no longer be a static sufficiency target after re-scan,
+    # while the audit ledger should still retain that the issue was found and resolved.
+    sufficiency_reviewed = 0
+    sufficiency_findings = 0
+    sufficiency_dispositions: Counter[str] = Counter()
+    for c in data.get("claims", []):
+        if c.get("sufficiency_status") == "reviewed":
+            sufficiency_reviewed += 1
+            sv = c.get("sufficiency_verdict")
+            if sv:
+                sufficiency_dispositions[str(sv)] += 1
+                if sv not in {"sufficient", "not-applicable"}:
+                    sufficiency_findings += 1
+
+    execution_summary = {
+        "level": effective,
+        "required_claims_reviewed": required - pending,
+        "required_claims_total": required,
+        "pending": pending,
+        "unresolved": unresolved,
+        "evidence_sufficiency_scan_targets": data.get("scan_summary", data.get("summary", {})).get("evidence_sufficiency_scan_targets", 0),
+        "evidence_sufficiency_records_reviewed": sufficiency_reviewed,
+        "evidence_sufficiency_findings": sufficiency_findings,
+        "evidence_sufficiency_dispositions": dict(sufficiency_dispositions),
+        "cross_source_metric_findings": metric_required,
+        "metric_dispositions": dict(Counter(str(f.get("verdict")) for f in data.get("metric_findings", []) if f.get("review_status") == "reviewed" and f.get("verdict"))),
+        "structural_findings_reviewed": sum(1 for f in data.get("style_findings", []) if f.get("review_status") == "reviewed"),
+        "formula_reviews_total": formula_required,
+        "formula_reviews_pending": formula_pending,
+        "formula_dual_validation_total": formula_dual_required,
+        "formula_dual_validation_pending": formula_dual_pending,
+        "reference_usage_total": reference_usage_required,
+        "reference_usage_pending": reference_usage_pending,
+        "table_visibility_total": table_visibility_required,
+        "table_visibility_pending": table_visibility_pending,
+    }
+    data["audit_execution_summary"] = execution_summary
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception as exc:
+        warnings.append(f"could not persist audit_execution_summary: {exc}")
+
+    result = {
+        "status": "ok" if not warnings else "warning",
+        "effective_audit_level": effective,
+        "required_by_level": required,
+        "pending": pending,
+        "unresolved": unresolved,
+        "structural_required_by_level": style_required,
+        "structural_pending": style_pending,
+        "metric_consistency_required_by_level": metric_required,
+        "metric_consistency_pending": metric_pending,
+        "formula_required_by_level": formula_required,
+        "formula_pending": formula_pending,
+        "formula_dual_validation_required": formula_dual_required,
+        "formula_dual_validation_pending": formula_dual_pending,
+        "reference_usage_required": reference_usage_required,
+        "reference_usage_pending": reference_usage_pending,
+        "table_visibility_required": table_visibility_required,
+        "table_visibility_pending": table_visibility_pending,
+        **execution_summary,
+        "warnings": warnings,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if not warnings else 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Build/check a focused academic precision-audit and structural-style queue")
+    sub = p.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("scan", help="scan a draft/DOCX and create focused claim/style audit queues")
+    s.add_argument("--root", default=".")
+    s.add_argument("--input", required=True)
+    s.add_argument("--json-out", default="references/research/precision-audit.json")
+    s.add_argument("--md-out", default="references/cnki/precision-audit.md")
+    s.add_argument("--level", choices=["auto", "low", "medium", "high"], default="auto", help="audit depth; auto reads assignment/workflow-config.json and defaults to medium")
+    a = sub.add_parser("audit", help="check that claims/style findings required by the selected audit level were resolved")
+    a.add_argument("--root", default=".")
+    a.add_argument("--file", default="references/research/precision-audit.json")
+    a.add_argument("--level", choices=["auto", "low", "medium", "high"], default="auto", help="audit depth; auto reads assignment/workflow-config.json and defaults to medium")
+    a.add_argument("--include-medium", action="store_true", help=argparse.SUPPRESS)
+    args = p.parse_args()
+    return cmd_scan(args) if args.command == "scan" else cmd_audit(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
