@@ -498,3 +498,303 @@ def section_structural_findings(paragraphs: list[dict[str, Any]]) -> tuple[list[
         # 3) Connector-at-paragraph-start density: pattern-based, not a ban on any single connector.
         connector_ps = [p for p in ps if p.get("start_connector")]
         if len(ps) >= 4 and len(connector_ps) >= 3 and len(connector_ps) / len(ps) >= 0.5:
+            counts = Counter(p["start_connector"] for p in connector_ps)
+            add(
+                section,
+                "connector-start-density",
+                "medium",
+                connector_ps,
+                f"{len(connector_ps)}/{len(ps)} body paragraphs begin with discourse connectors; inspect whether transitions are mechanically repeated.",
+                18,
+                {"paragraph_count": len(ps), "connector_paragraphs": len(connector_ps), "connector_counts": dict(counts)},
+            )
+
+        # 4) Length symmetry: weak signal only. It is never proof and should not trigger LOW/MEDIUM by itself.
+        lens = [p["length"] for p in ps if p["length"] >= 40]
+        if len(lens) >= 5:
+            mean = sum(lens) / len(lens)
+            variance = sum((x - mean) ** 2 for x in lens) / len(lens)
+            cv = math.sqrt(variance) / mean if mean else 1.0
+            ratio = max(lens) / max(min(lens), 1)
+            if cv <= 0.14 and ratio <= 1.55:
+                add(
+                    section,
+                    "paragraph-length-symmetry",
+                    "low",
+                    [p for p in ps if p["length"] >= 40],
+                    "Paragraph lengths are unusually uniform. This is only a weak structural signal; keep it if the content naturally requires parallel treatment.",
+                    8,
+                    {"count": len(lens), "mean_chars": round(mean, 1), "cv": round(cv, 3), "max_min_ratio": round(ratio, 2)},
+                )
+
+    return findings, section_scores
+
+
+def cross_source_metric_findings(paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for p in paragraphs:
+        if not p.get("cross_source_metric"):
+            continue
+        pairs = p.get("metric_qualifier_pairs", [])
+        severe = any(set(pair) & {"单向", "往返", "RTT"} for pair in pairs)
+        findings.append({
+            "metric_id": f"metric-{len(findings)+1:04d}",
+            "section": p.get("section"),
+            "paragraph": p.get("paragraph"),
+            "text": p.get("text"),
+            "citations": p.get("citations", []),
+            "numbers": p.get("numbers", []),
+            "metric_terms": p.get("metric_terms", []),
+            "qualifier_pairs": pairs,
+            "severity": "high" if severe else "medium",
+            "review_status": "pending",
+            "verdict": None,
+            "revision": None,
+            "notes": None,
+        })
+    return findings
+
+
+def _normalized_heading(line: str) -> str:
+    return re.sub(r"\s+", "", line).lower()
+
+
+def _is_reference_heading(line: str) -> bool:
+    h = _normalized_heading(line)
+    return h in {"参考文献", "参考资料", "references", "reference"} or h.startswith("#参考文献")
+
+
+def _delimiter_problem(text: str) -> str | None:
+    pairs = {')': '(', ']': '[', '}': '{', '）': '（', '】': '【'}
+    opens = set(pairs.values())
+    stack: list[tuple[str, int]] = []
+    for i, ch in enumerate(text):
+        if ch in opens:
+            stack.append((ch, i))
+        elif ch in pairs:
+            if not stack or stack[-1][0] != pairs[ch]:
+                return f"mismatched closing delimiter `{ch}` at char {i + 1}"
+            stack.pop()
+    if stack:
+        ch, i = stack[-1]
+        return f"unclosed delimiter `{ch}` opened at char {i + 1}"
+    return None
+
+
+def _dual_validation_reasons(text: str) -> list[str]:
+    """Return conservative static signals for formulas that deserve two-path validation.
+
+    This is intentionally a queueing heuristic, not a truth/complexity oracle. The agent
+    must still escalate semantically complex formulas the heuristic does not recognize.
+    """
+    reasons: list[str] = []
+    q_terms = len(re.findall(r"Q\s*\(", text))
+    if q_terms >= 2:
+        reasons.append("multiple-probability-tail-terms")
+    if re.search(r"[∫∑ΣΠ]", text) or re.search(r"\b(?:sum|integral|expectation|Pr|Prob)\s*[\[(]", text, flags=re.I):
+        reasons.append("probability-or-aggregate-expression")
+    if re.search(r"\b(?:min|max|argmin|argmax)\s*\(", text, flags=re.I):
+        reasons.append("decision-or-optimization-operator")
+    if re.search(r"≈|\bapprox\b", text, flags=re.I) and re.search(r"[+−-].*[+−-]", text):
+        reasons.append("multi-term-approximation")
+    return reasons
+
+
+def formula_review_findings(lines: list[str]) -> list[dict[str, Any]]:
+    referenced: set[int] = set()
+    for line in lines:
+        for m in FORMULA_XREF_RE.finditer(line):
+            referenced.add(int(m.group(1)))
+
+    findings: list[dict[str, Any]] = []
+    in_refs = False
+    for pno, line in enumerate(lines, 1):
+        if not line:
+            continue
+        if _is_reference_heading(line):
+            in_refs = True
+            continue
+        if in_refs:
+            continue
+        m = FORMULA_NO_RE.search(line)
+        if not m:
+            continue
+        formula_text = line[:m.start()].strip()
+        if not formula_text or not MATH_HINT_RE.search(formula_text):
+            continue
+        eqno = int(m.group(1))
+        syntax_issue = _delimiter_problem(formula_text)
+        dual_reasons = _dual_validation_reasons(formula_text)
+        findings.append({
+            "formula_id": f"formula-{eqno:04d}",
+            "equation_no": eqno,
+            "paragraph": pno,
+            "text": formula_text,
+            "referenced_in_prose": eqno in referenced,
+            "syntax_issue": syntax_issue,
+            "severity": "high" if syntax_issue else ("medium" if eqno in referenced else "low"),
+            "review_status": "pending",
+            "verdict": None,
+            "verification_method": None,
+            "verification_note": None,
+            "dual_validation_required": bool(dual_reasons),
+            "dual_validation_reasons": dual_reasons,
+            "verification_paths": [],
+            "revision": None,
+        })
+    return findings
+
+
+def formula_required_for_level(f: dict[str, Any], level: str) -> bool:
+    if f.get("syntax_issue"):
+        return True
+    if f.get("referenced_in_prose"):
+        return True
+    return level == "high"
+
+
+def reference_usage_findings(lines: list[str]) -> list[dict[str, Any]]:
+    in_refs = False
+    body_citations: set[int] = set()
+    references: dict[int, tuple[int, str]] = {}
+    for pno, line in enumerate(lines, 1):
+        if not line:
+            continue
+        if _is_reference_heading(line):
+            in_refs = True
+            continue
+        if in_refs:
+            m = REF_ENTRY_RE.match(line)
+            if m:
+                references[int(m.group(1))] = (pno, line)
+            continue
+        for blob in CIT_RE.findall(line):
+            body_citations.update(citation_ids(blob))
+
+    findings: list[dict[str, Any]] = []
+    for rid, (pno, line) in sorted(references.items()):
+        if rid not in body_citations:
+            findings.append({
+                "reference_id": f"ref-usage-{rid:04d}",
+                "reference_no": rid,
+                "issue": "uncited-reference",
+                "paragraph": pno,
+                "text": line,
+                "review_status": "pending",
+                "resolution": None,
+                "revision": None,
+                "notes": None,
+            })
+    for cid in sorted(body_citations):
+        if references and cid not in references:
+            findings.append({
+                "reference_id": f"ref-usage-missing-{cid:04d}",
+                "reference_no": cid,
+                "issue": "citation-without-reference-entry",
+                "paragraph": None,
+                "text": f"In-text citation [{cid}] has no numbered reference-list entry.",
+                "review_status": "pending",
+                "resolution": None,
+                "revision": None,
+                "notes": None,
+            })
+    return findings
+
+
+def scan_text(text: str, source: str) -> dict[str, Any]:
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n")]
+    formula_findings = formula_review_findings(lines)
+    ref_usage_findings = reference_usage_findings(lines)
+    section = ""
+    claims: list[dict[str, Any]] = []
+    paragraphs: list[dict[str, Any]] = []
+    phrase_counts = Counter()
+    marker_counts = Counter()
+    paragraph_lengths: list[int] = []
+    idx = 0
+
+    for pno, line in enumerate(lines, 1):
+        if not line:
+            continue
+        if line.startswith("摘要：") or line.startswith("摘要:"):
+            section = "摘要"
+        elif line.startswith("关键词：") or line.startswith("关键词:"):
+            continue
+        # Reference lists are bibliography metadata, not prose claims. Explicitly switch
+        # sections even when the heading is plain DOCX text rather than Markdown/# syntax.
+        if _is_reference_heading(line):
+            section = "参考文献"
+            continue
+        new_section = infer_section(line, section)
+        if new_section != section and (HEAD_RE.match(line) or line.startswith("#")):
+            section = new_section
+            continue
+        if "参考文献" in section or section.lower() in {"references", "reference"}:
+            continue
+
+        # Paragraph-level cross-source metric check. This catches cases where adjacent
+        # values are individually cited but use different metric definitions/populations
+        # (e.g. one-way vs RTT, different datasets, different bandwidth assumptions).
+        line_cits: list[int] = []
+        for b in CIT_RE.findall(line):
+            line_cits.extend(citation_ids(b))
+        line_cits = sorted(set(line_cits))
+        line_without_citations = CIT_RE.sub("", line)
+        line_nums = [m.group(0).strip() for m in NUM_RE.finditer(line_without_citations) if re.search(r"\d", m.group(0))]
+        line_metric_terms = [t for t in METRIC_TERMS if t.lower() in line.lower()]
+        qualifier_pairs = [[a, b] for a, b in METRIC_QUALIFIER_PAIRS if a.lower() in line.lower() and b.lower() in line.lower()]
+        cross_source_metric = len(line_cits) >= 2 and len(line_nums) >= 2 and bool(line_metric_terms) and bool(qualifier_pairs)
+
+        clean_len = len(re.sub(r"\s+", "", line))
+        paragraph_lengths.append(clean_len)
+        for ph in AI_PHRASES:
+            if ph in line:
+                phrase_counts[ph] += line.count(ph)
+        for mk in STRUCTURE_MARKERS:
+            if mk in line:
+                marker_counts[mk] += line.count(mk)
+
+        enumerators = detect_enumerators(line)
+        for fam, _, _ in enumerators:
+            marker_counts[fam] += 1
+        paragraphs.append({
+            "paragraph": pno,
+            "section": section or "<unsectioned>",
+            "text": line,
+            "length": clean_len,
+            "enumerators": enumerators,
+            "opener_template": normalized_paragraph_opener(line),
+            "start_connector": paragraph_start_connector(line),
+            "citations": line_cits,
+            "numbers": line_nums,
+            "metric_terms": line_metric_terms,
+            "metric_qualifier_pairs": qualifier_pairs,
+            "cross_source_metric": cross_source_metric,
+        })
+
+        sentences = [s.strip() for s in SENT_SPLIT_RE.split(line) if s.strip()]
+        for sent in sentences:
+            idx += 1
+            cits: list[int] = []
+            citation_blobs = CIT_RE.findall(sent)
+            for b in citation_blobs:
+                cits.extend(citation_ids(b))
+            cits = sorted(set(cits))
+            sent_without_citations = CIT_RE.sub("", sent)
+            nums = [m.group(0).strip() for m in NUM_RE.finditer(sent_without_citations) if re.search(r"\d", m.group(0))]
+            strong = [t for t in STRONG_TERMS if t in sent]
+            causal = [t for t in CAUSAL_TERMS if t in sent]
+            comp = [t for t in COMPARATIVE_TERMS if t in sent]
+            generality = [t for t in GENERALITY_TERMS if t in sent]
+            attribution_detected = bool(ATTRIBUTION_RE.search(sent))
+            attribution_site_check = strong_attribution_site(sent, cits)
+            tags: list[str] = []
+            if nums:
+                tags.append("numeric-claim")
+            if strong:
+                tags.append("strong-claim")
+            if causal:
+                tags.append("causal-claim")
+            if comp:
+                tags.append("comparative-claim")
+            if len(cits) >= 3:
