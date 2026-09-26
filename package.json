@@ -1,0 +1,29 @@
+{
+  "name": "dsh-cnki-academic-writing-skill",
+  "version": "2.7.3",
+  "description": "CNKI-oriented academic writing skill bundle for DeepSeek Harness",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "cnki-academic-writing-v2/**/*",
+    "README.md",
+    "CHANGELOG.md",
+    "install.ps1",
+    "uninstall.ps1",
+    "CNKI论文设置-source/**/*"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ciallo1145/cnki-academic-writing-skill.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-skill-filesystem": ">=0.1.0-rc.6 <0.2.0"
+  }
+}
