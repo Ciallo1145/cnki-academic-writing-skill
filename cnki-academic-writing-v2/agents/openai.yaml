@@ -1,0 +1,4 @@
+interface:
+  display_name: "CNKI Academic Writing V2.7.3"
+  short_description: "Requirement-first CNKI research, targeted evidence audit, evidence-safe polish, and real visual QA"
+  default_prompt: "Ingest assignment requirements and the authoritative template first. Search CNKI when relevant, preserve honest evidence levels and provenance, use an adaptive evidence budget instead of bulk-reading the corpus, draft from verified evidence, run the configured targeted precision audit, apply evidence-safe prose polish without factual drift, and complete real rendered-page Visual QA before claiming layout passed. Prefer the simplest workflow that preserves assignment compliance and evidence integrity."
